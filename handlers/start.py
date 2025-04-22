@@ -7,7 +7,7 @@ from utils.config import DB_FILE
 
 ASK_DAILY_LIMIT = range(1)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):# fixme do not add new entry for the same user, need to update
     await update.message.reply_text("👋 Welcome! Please enter your daily calorie limit (in kcal):")
     return ASK_DAILY_LIMIT
 
