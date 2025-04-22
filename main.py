@@ -6,14 +6,19 @@ from datetime import datetime
 from openai import OpenAI
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, \
-    CallbackQueryHandler
+from telegram.ext import (ApplicationBuilder,
+                          CommandHandler,
+                          ContextTypes,
+                          MessageHandler,
+                          filters,
+                          CallbackQueryHandler,
+                          ConversationHandler)
 
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DB_FILE = os.getenv("DB_FILE", "data.sqlite")
-client = OpenAI(api_key=OPENAI_API_KEY)
+from data.get_custom import get_custom_prompt
+from data.get_user_info import get_user_info
+from handlers.add_custom import add_custom
+from handlers.start import start, set_daily_limit, ASK_DAILY_LIMIT
+from utils.config import OPENAI_API_KEY, DB_FILE, BOT_TOKEN, oai_client
 
 
 def init_db():
@@ -28,13 +33,24 @@ def init_db():
             datetime TEXT
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            userid INTEGER,
+            daily_calories INTEGER
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS custom (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            userid INTEGER,
+            name TEXT,
+            calories INTEGER,
+            aliases TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(f"Hello, {user.first_name}!")
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,14 +75,26 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WHERE userid = ? AND datetime BETWEEN ? AND ?
             ORDER BY calories DESC LIMIT 1
         ''', (user_id, today_start, today_end))
-    row = cursor.fetchone()
+    top_row = cursor.fetchone()
+    cursor.execute('''
+            SELECT product, calories, datetime FROM food_log
+            WHERE userid = ? AND datetime BETWEEN ? AND ?
+            ORDER BY datetime DESC
+        ''', (user_id, today_start, today_end))
+    items = cursor.fetchall()
     conn.close()
 
-    if row:
-        top_food, top_cal = row
+    if items:
+        item_list = "\n".join(
+            [f"• <b>{product}</b> – {cal} kcal" for product, cal, _ in items]
+        )
+        top_food, top_cal = top_row
+        diff = (limit:= get_user_info(user_id).daily_calories) - total
         await update.message.reply_text(
-            f"🍽️ Total calories today: <b>{total}</b> kcal\n"
-            f"🔥 Highest: <b>{top_food}</b> with <b>{top_cal}</b> calories.",
+            f"🍽️ Total calories today: <b>{total}/{limit}</b> kcal\n" +
+            (f"👍" if diff > 0 else "👎") + f" Diff: <b>{diff}</b> kcal\n"
+            f"🔥 Highest: <b>{top_food}</b> with <b>{top_cal}</b> kcal\n\n"
+            f"📋 Today's log:\n{item_list}",
             parse_mode=ParseMode.HTML
         )
     else:
@@ -114,21 +142,25 @@ async def handle_food(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     print(f"Received message from {user}: {food}")
     prompt = (f"How many calories are there in '{food}'? "
-              f"Respond with a JSON like: {{\"food\": \"food name\", \"calories\": 123}}. "
+              f"Respond with a JSON like: {{\"food\": \"food name\", \"calories\": 123, \"error\": \"reason if error\"}}. "
               f"Summarize 'food name' in answer to couple words in english starting with capital letter.")
 
     try:
-        response = client.chat.completions.create(
+        response = oai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a calories calculator."},
+                {"role": "system", "content": get_custom_prompt(user.id)},
                 {"role": "user", "content": prompt}
             ]
         )
+        print(get_custom_prompt(user.id))
         content = response.choices[0].message.content
         print(f"Response from OpenAI: {content}")
         # Try to parse JSON
         calorie_data = json.loads(content)
+        if error_message := calorie_data.get("error"):
+            return await update.message.reply_text(f"⚠️ Error: {error_message}")
         product = calorie_data['food']
         calories = int(calorie_data['calories'])
         timestamp = datetime.utcnow().isoformat()
@@ -158,11 +190,20 @@ async def handle_food(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("start", start)],
+            states={
+                ASK_DAILY_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_daily_limit)]
+            },
+            fallbacks=[],
+        )
+    )
     app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("add", add_custom))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_food))
     app.add_handler(CallbackQueryHandler(remove_entry, pattern=r"^remove:\d+$"))
-
     print("Bot is running...")
     app.run_polling()
 
